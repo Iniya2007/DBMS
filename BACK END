@@ -1,0 +1,143 @@
+from flask import Flask, request, jsonify, Response
+from flask_cors import CORS
+import cv2, datetime, os, threading, time, sqlite3
+
+app = Flask(__name__)
+CORS(app)
+
+DB_PATH="gallery.db"; CONFIDENCE=0.55; CAMERA_INDEX=0
+FRAME_SKIP=3; AI_SKIP=6; JPEG_QUALITY=60
+
+DEFECT_CLASSES=["crack","color_fading","scratch","dust","moisture_stain","mold","chipping","missing_part","yellowing","reflective_anomaly"]
+DEFECT_COLORS={"crack":(0,0,255),"color_fading":(0,140,255),"scratch":(0,220,220),"dust":(128,128,128),"moisture_stain":(255,80,0),"mold":(0,200,0),"chipping":(200,0,180),"missing_part":(180,0,255),"yellowing":(0,200,200),"reflective_anomaly":(255,255,0)}
+
+latest_frame=None; latest_detections=[]; sensor_data={}; model=None; frame_count=0
+
+def init_db():
+    conn=sqlite3.connect(DB_PATH); c=conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS exhibits (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, origin TEXT, age TEXT, donor TEXT, value TEXT, material TEXT, discovered TEXT, location TEXT, emoji TEXT, status TEXT DEFAULT 'good', created_at TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS detections (id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT, confidence REAL, timestamp TEXT, date TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS sensor_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, temperature REAL, humidity REAL, light_level REAL, temp_risk TEXT, humid_risk TEXT, light_risk TEXT, timestamp TEXT, date TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, exhibit TEXT, defect TEXT, severity TEXT, message TEXT, timestamp TEXT, date TEXT)''')
+    c.execute("SELECT COUNT(*) FROM exhibits")
+    if c.fetchone()[0]==0:
+        now=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for s in [("Bronze Warrior Statue","Thanjavur","2200 years","Govt. of India","2.5 Crore","Bronze","1952","Hall A"),("Mona Lisa Copy","Florence","200 years","French Embassy","45 Lakh","Canvas","1980","Hall B"),("Ancient Pottery Vase","Harappa","4000 years","ASI","1.2 Crore","Clay","1921","Hall A"),("Royal Gold Necklace","Mysore","300 years","Wadiyar Family","8 Crore","Gold","1947","Vault C"),("Stone Elephant Idol","Mahabalipuram","1500 years","TN Archaeology","3.8 Crore","Stone","1965","Hall D"),("Palm Leaf Manuscript","Madurai","800 years","Tamil University","90 Lakh","Palm Leaf","2001","Archive")]:
+            conn.execute("INSERT INTO exhibits (name,origin,age,donor,value,material,discovered,location,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",(*s,"good",now))
+    conn.commit(); conn.close(); print("DB Ready!")
+
+def get_db():
+    conn=sqlite3.connect(DB_PATH); conn.row_factory=sqlite3.Row; return conn
+
+def load_model():
+    global model
+    try:
+        from ultralytics import YOLO
+        model=YOLO("best.pt") if os.path.exists("best.pt") else YOLO("yolov8n.pt")
+        print("Model ready!")
+    except: model=None
+
+def camera_thread():
+    global latest_frame,latest_detections,frame_count
+    cap=cv2.VideoCapture(CAMERA_INDEX)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,480); cap.set(cv2.CAP_PROP_FRAME_HEIGHT,360)
+    cap.set(cv2.CAP_PROP_FPS,15); cap.set(cv2.CAP_PROP_BUFFERSIZE,1)
+    while True:
+        ret,frame=cap.read()
+        if not ret: time.sleep(0.1); continue
+        frame_count+=1
+        if frame_count%FRAME_SKIP!=0: continue
+        if model and frame_count%AI_SKIP==0:
+            try:
+                dets=[]
+                for r in model(frame,conf=CONFIDENCE,verbose=False,imgsz=320):
+                    for box in r.boxes:
+                        cid=int(box.cls[0]); conf=float(box.conf[0])
+                        x1,y1,x2,y2=map(int,box.xyxy[0])
+                        label=DEFECT_CLASSES[cid] if cid<len(DEFECT_CLASSES) else f"cls_{cid}"
+                        color=DEFECT_COLORS.get(label,(0,255,0))
+                        cv2.rectangle(frame,(x1,y1),(x2,y2),color,2)
+                        txt=f"{label} {conf:.0%}"
+                        cv2.rectangle(frame,(x1,y1-22),(x1+len(txt)*9,y1),color,-1)
+                        cv2.putText(frame,txt,(x1,y1-5),cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,255,255),1)
+                        dets.append({"label":label,"confidence":round(conf*100,1),"timestamp":datetime.datetime.now().strftime("%H:%M:%S")})
+                latest_detections=dets
+                if dets:
+                    conn=get_db(); now=datetime.datetime.now()
+                    for d in dets:
+                        conn.execute("INSERT INTO detections (label,confidence,timestamp,date) VALUES (?,?,?,?)",(d["label"],d["confidence"],now.strftime("%H:%M:%S"),now.strftime("%Y-%m-%d")))
+                    conn.commit(); conn.close()
+            except Exception as e: print(f"AI:{e}")
+        cv2.putText(frame,datetime.datetime.now().strftime("%H:%M:%S"),(8,20),cv2.FONT_HERSHEY_SIMPLEX,0.5,(200,200,200),1)
+        latest_frame=frame.copy(); time.sleep(0.01)
+
+def generate_frames():
+    while True:
+        if latest_frame is not None:
+            ret,buf=cv2.imencode('.jpg',latest_frame,[cv2.IMWRITE_JPEG_QUALITY,JPEG_QUALITY])
+            if ret: yield(b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'+buf.tobytes()+b'\r\n')
+        time.sleep(0.05)
+
+@app.route('/')
+def index(): return "AI Gallery Backend with SQLite DB Running!"
+@app.route('/video_feed')
+def video_feed(): return Response(generate_frames(),mimetype='multipart/x-mixed-replace; boundary=frame')
+@app.route('/api/exhibits',methods=['GET'])
+def get_exhibits():
+    conn=get_db(); rows=conn.execute("SELECT * FROM exhibits").fetchall(); conn.close()
+    return jsonify([dict(r) for r in rows])
+@app.route('/api/exhibits',methods=['POST'])
+def add_exhibit():
+    d=request.get_json(); now=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"); conn=get_db()
+    conn.execute("INSERT INTO exhibits (name,origin,age,donor,value,material,discovered,location,emoji,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",(d.get('name'),d.get('origin'),d.get('age'),d.get('donor'),d.get('value'),d.get('material'),d.get('discovered'),d.get('location'),d.get('emoji',''),'good',now))
+    conn.commit(); conn.close(); return jsonify({"status":"ok"}),201
+@app.route('/api/exhibits/<int:eid>',methods=['DELETE'])
+def delete_exhibit(eid):
+    conn=get_db(); conn.execute("DELETE FROM exhibits WHERE id=?",(eid,)); conn.commit(); conn.close()
+    return jsonify({"status":"ok"})
+@app.route('/api/sensors',methods=['POST'])
+def receive_sensors():
+    global sensor_data
+    d=request.get_json()
+    if d:
+        sensor_data={**d,"timestamp":datetime.datetime.now().strftime("%H:%M:%S")}
+        conn=get_db(); now=datetime.datetime.now()
+        conn.execute("INSERT INTO sensor_logs (temperature,humidity,light_level,temp_risk,humid_risk,light_risk,timestamp,date) VALUES (?,?,?,?,?,?,?,?)",(d.get('temperature'),d.get('humidity'),d.get('light_level'),d.get('temp_risk'),d.get('humid_risk'),d.get('light_risk'),now.strftime("%H:%M:%S"),now.strftime("%Y-%m-%d")))
+        conn.commit(); conn.close(); return jsonify({"status":"ok"}),200
+    return jsonify({"status":"error"}),400
+@app.route('/api/sensors',methods=['GET'])
+def get_sensors():
+    return jsonify(sensor_data if sensor_data else {"temperature":"--","humidity":"--","light_level":"--","temp_risk":"UNKNOWN","humid_risk":"UNKNOWN","light_risk":"UNKNOWN","timestamp":"--"})
+@app.route('/api/sensors/history',methods=['GET'])
+def get_sensor_history():
+    conn=get_db(); rows=conn.execute("SELECT * FROM sensor_logs ORDER BY id DESC LIMIT 20").fetchall(); conn.close()
+    return jsonify([dict(r) for r in rows])
+@app.route('/api/detections',methods=['GET'])
+def get_detections(): return jsonify(latest_detections)
+@app.route('/api/log',methods=['GET'])
+def get_log():
+    conn=get_db(); rows=conn.execute("SELECT * FROM detections ORDER BY id DESC LIMIT 50").fetchall(); conn.close()
+    return jsonify([dict(r) for r in rows])
+@app.route('/api/stats',methods=['GET'])
+def get_stats():
+    conn=get_db(); rows=conn.execute("SELECT label,COUNT(*) as count FROM detections GROUP BY label").fetchall(); conn.close()
+    return jsonify({r['label']:r['count'] for r in rows})
+@app.route('/api/alerts',methods=['GET'])
+def get_alerts():
+    conn=get_db(); rows=conn.execute("SELECT * FROM alerts ORDER BY id DESC LIMIT 50").fetchall(); conn.close()
+    return jsonify([dict(r) for r in rows])
+@app.route('/api/alerts/clear',methods=['POST'])
+def clear_alerts():
+    conn=get_db(); conn.execute("DELETE FROM alerts"); conn.commit(); conn.close()
+    return jsonify({"status":"ok"})
+
+if __name__=='__main__':
+    init_db()
+    print("\n"+"="*50)
+    print("  AI Gallery — SQLite DB Ready!")
+    print("  Backend: http://localhost:5000")
+    print("="*50+"\n")
+    threading.Thread(target=load_model,daemon=True).start()
+    time.sleep(1)
+    threading.Thread(target=camera_thread,daemon=True).start()
+    app.run(host='0.0.0.0',port=5000,debug=False,threaded=True,use_reloader=False)
