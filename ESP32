@@ -1,0 +1,134 @@
+// ============================================================
+// AI Gallery Defect Detection System - ESP32 Sensor Code
+// Hardware: ESP32 + DHT22 (Temp/Humidity) + LDR (Light)
+// Sends sensor data to Python backend via WiFi HTTP POST
+// ============================================================
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <DHT.h>
+#include <Arduino_JSON.h>
+
+// ---------- WiFi Credentials ----------
+const char* ssid     = "bm";       // <-- Change this
+const char* password = "12345678";    // <-- Change this
+
+// ---------- Backend Server ----------
+// Replace with your laptop's IP address (run ipconfig in CMD to find it)
+const char* serverURL = "http://192.168.1.100:5000/api/sensors"; // <-- Change IP
+
+// ---------- Pin Definitions ----------
+#define DHTPIN      5       // DHT22 data pin connected to GPIO4
+#define DHTTYPE     DHT22
+#define LDR_PIN     34      // LDR connected to GPIO34 (ADC pin)
+#define LED_PIN     2       // Built-in LED for status indication
+
+// ---------- Sensor Setup ----------
+DHT dht(DHTPIN, DHTTYPE);
+
+// ---------- Timing ----------
+unsigned long lastSendTime = 0;
+const long sendInterval = 10000; // Send every 10 seconds
+
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  dht.begin();
+  Serial.println("DHT22 sensor initialized.");
+
+  // Connect to WiFi
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi Connected!");
+    Serial.print("ESP32 IP Address: ");
+    Serial.println(WiFi.localIP());
+    digitalWrite(LED_PIN, HIGH); // LED ON = connected
+  } else {
+    Serial.println("\nWiFi connection FAILED. Check credentials.");
+  }
+}
+
+// ============================================================
+void loop() {
+  unsigned long currentTime = millis();
+
+  if (currentTime - lastSendTime >= sendInterval) {
+    lastSendTime = currentTime;
+
+    if (WiFi.status() == WL_CONNECTED) {
+      // Read sensor values
+      float temperature = dht.readTemperature(); // Celsius
+      float humidity    = dht.readHumidity();
+      int   ldrRaw      = analogRead(LDR_PIN);   // 0-4095
+      float lightLevel  = map(ldrRaw, 0, 4095, 0, 100); // Convert to 0-100%
+
+      // Validate DHT reading
+      if (isnan(temperature) || isnan(humidity)) {
+        Serial.println("ERROR: Failed to read DHT22 sensor!");
+        return;
+      }
+
+      // Print to Serial Monitor
+      Serial.println("=============================");
+      Serial.print("Temperature : "); Serial.print(temperature); Serial.println(" C");
+      Serial.print("Humidity    : "); Serial.print(humidity);    Serial.println(" %");
+      Serial.print("Light Level : "); Serial.print(lightLevel);  Serial.println(" %");
+
+      // Compute risk levels
+      String tempRisk  = (temperature > 30) ? "HIGH" : (temperature > 25) ? "MEDIUM" : "LOW";
+      String humidRisk = (humidity > 70)    ? "HIGH" : (humidity > 55)    ? "MEDIUM" : "LOW";
+      String lightRisk = (lightLevel > 70)  ? "HIGH" : (lightLevel > 40)  ? "MEDIUM" : "LOW";
+
+      // Build JSON payload
+      JSONVar payload;
+      payload["temperature"]  = temperature;
+      payload["humidity"]     = humidity;
+      payload["light_level"]  = lightLevel;
+      payload["temp_risk"]    = tempRisk;
+      payload["humid_risk"]   = humidRisk;
+      payload["light_risk"]   = lightRisk;
+
+      String jsonString = JSON.stringify(payload);
+      Serial.print("Sending: "); Serial.println(jsonString);
+
+      // HTTP POST
+      HTTPClient http;
+      http.begin(serverURL);
+      http.addHeader("Content-Type", "application/json");
+
+      int responseCode = http.POST(jsonString);
+
+      if (responseCode > 0) {
+        Serial.print("Server response: "); Serial.println(responseCode);
+        String response = http.getString();
+        Serial.println(response);
+        // Blink LED to indicate successful send
+        digitalWrite(LED_PIN, LOW);
+        delay(100);
+        digitalWrite(LED_PIN, HIGH);
+      } else {
+        Serial.print("HTTP POST failed. Error: ");
+        Serial.println(http.errorToString(responseCode));
+      }
+
+      http.end();
+
+    } else {
+      Serial.println("WiFi disconnected. Reconnecting...");
+      WiFi.begin(ssid, password);
+    }
+  }
+}
